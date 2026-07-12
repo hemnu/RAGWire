@@ -38,7 +38,11 @@ plugins:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
@@ -58,6 +62,7 @@ nav:
     - Quick Tutorial: tutorial.md
     - Metadata & Filtering: metadata.md
     - Custom Metadata: custom_metadata.md
+    - Metadata Schema Examples: metadata_schemas.md
     - RAG Agent: rag_agent.md
   - Providers:
     - Ollama (Local): ollama.md
@@ -78,7 +83,14 @@ nav:
     - Diverse Results (MMR): cookbook/mmr.md
     - Preview Documents: cookbook/preview_documents.md
     - Logging Setup: cookbook/logging.md
+    - LangSmith Tracing: cookbook/langsmith.md
     - Metadata-Aware Chatbot: cookbook/filtered_chatbot.md
+  - Architecture:
+    - System Overview: architecture/overview.md
+    - Ingestion Pipeline: architecture/ingestion_pipeline.md
+    - Retrieval Pipeline: architecture/retrieval_pipeline.md
+    - Metadata Extraction: architecture/metadata_extraction.md
+    - Component Map: architecture/component_map.md
   - API Reference: api_reference.md
 
 extra:

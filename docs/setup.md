@@ -1,13 +1,11 @@
-# RAGWire — Setup Guide
-
-This guide covers the generic setup of RAGWire, prerequisites, and the project structure. Provider-specific configuration is covered in the individual provider docs.
+# Installation & Setup
 
 ## Prerequisites
 
 - Python 3.9 or higher
 - [Docker](https://www.docker.com/) (for running Qdrant locally)
 
-## 1. Install RAGWire
+## Install RAGWire
 
 Install the base package:
 
@@ -33,7 +31,7 @@ For hybrid search (dense + sparse), also install:
 pip install fastembed
 ```
 
-## 2. Start Qdrant
+## Start Qdrant
 
 RAGWire uses [Qdrant](https://qdrant.tech/) as its vector database. Run it locally with Docker:
 
@@ -48,40 +46,82 @@ curl http://localhost:6333/healthz
 # {"title":"qdrant - vector search engine"}
 ```
 
-## 3. Configure
+## Create config.yaml
 
-Copy the example config and edit it for your provider:
-
-```bash
-cp config.example.yaml config.yaml
-```
-
-The minimal required sections are:
+Create a `config.yaml` file in your project directory. Below is a full working example using Ollama (local, no API key):
 
 ```yaml
+# =================================================================
+# Document Loader
+# =================================================================
+loader:
+  extensions: [".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md"]
+
+# =================================================================
+# Text Splitter
+# =================================================================
+splitter:
+  chunk_size: 10000
+  chunk_overlap: 2000
+  strategy: "markdown"   # "markdown" | "recursive"
+
+# =================================================================
+# Embedding Model
+# =================================================================
 embeddings:
-  provider: "..."
-  model: "..."
+  provider: "ollama"
+  model: "nomic-embed-text"
+  base_url: "http://localhost:11434"
 
+# =================================================================
+# LLM — used for metadata extraction on every ingested document
+# =================================================================
 llm:
-  provider: "..."
-  model: "..."
+  provider: "ollama"
+  model: "qwen3.5:9b"
+  base_url: "http://localhost:11434"
+  num_ctx: 65536         # optional — override context window if chunks are large
 
+# =================================================================
+# Metadata Extraction (optional)
+# =================================================================
+# metadata:
+#   config_file: "metadata.yaml"   # Custom fields (see Custom Metadata docs)
+#                                  # If omitted, defaults to: company_name,
+#                                  # doc_type, fiscal_quarter, fiscal_year
+
+# =================================================================
+# Vector Store (Qdrant)
+# =================================================================
 vectorstore:
   url: "http://localhost:6333"
   collection_name: "my_docs"
-  use_sparse: true
+  use_sparse: true       # Enables hybrid search (requires: pip install fastembed)
+  force_recreate: false  # Set true ONLY to wipe and rebuild the collection
 
+# =================================================================
+# Retriever
+# =================================================================
 retriever:
-  search_type: "hybrid"
+  search_type: "hybrid"  # "similarity" | "mmr" | "hybrid"
   top_k: 5
+  auto_filter: false     # set true to enable LLM-based filter extraction from every query
+
+# =================================================================
+# Logging
+# =================================================================
+logging:
+  level: "INFO"
+  console_output: true
+  colored: true
+  # log_file: "logs/rag.log"
 ```
 
-See the provider docs for the exact values to fill in.
+See the provider docs for equivalent configs using OpenAI, Google, Groq, or HuggingFace.
 
-### Using environment variables in config
+### Using environment variables
 
-Any string value in `config.yaml` can reference an environment variable using `${VAR}` syntax:
+Any value in `config.yaml` can reference an environment variable using `${VAR}` syntax:
 
 ```yaml
 vectorstore:
@@ -94,16 +134,17 @@ llm:
   api_key: "${OPENAI_API_KEY}"
 ```
 
-RAGWire resolves these at startup (after loading `.env` via `python-dotenv`). If a variable is not set, the placeholder is kept and a warning is logged.
+RAGWire resolves these at startup via `python-dotenv`. If a variable is not set, the placeholder is kept and a warning is logged.
 
-## 4. Place Documents
+### LangSmith tracing (optional)
 
-Put your PDF (or DOCX, XLSX, PPTX, TXT, MD) files in `examples/data/`:
+To enable LLM call tracing via [LangSmith](https://smith.langchain.com), add these to your `.env` file:
 
-```
-examples/
-└── data/
-    └── Apple_10k_2025.pdf
+```env
+LANGSMITH_API_KEY=your_api_key_here
+LANGSMITH_PROJECT=RAGWire
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGCHAIN_TRACING_V2=true
 ```
 
 ## 5. Run

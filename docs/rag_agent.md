@@ -37,32 +37,73 @@ print(f"Ingested {stats['processed']} docs, {stats['chunks_created']} chunks")
 
 ---
 
-## 2. Define the Retrieval Tool
+## 2. Define Two Tools
+
+The agent gets two tools with clear separation of concerns:
+
+- **`get_filter_context`** — call when metadata awareness is needed. Returns available fields, stored values, extracted filter suggestions, and instructions. Always fresh from Qdrant — safe to call multiple times in multi-query flows.
+- **`search_documents`** — pure retrieval. Accepts explicit filters the agent decided from the context.
 
 ```python
 from langchain.tools import tool
+from typing import Optional
 
 @tool
-def search_documents(query: str) -> str:
+def get_filter_context(query: str) -> str:
+    """Get available metadata fields, stored values, and filter suggestions for a query.
+
+    Call this before search_documents when the query may involve specific metadata
+    (e.g. a company, year, document type, author). The returned context shows what
+    filters are available and what was extracted from your query — use it to decide
+    what filters to pass to search_documents.
+
+    Skip this tool for purely semantic queries with no metadata intent.
+    """
+    return rag.get_filter_context(query)
+
+
+@tool
+def search_documents(query: str, filters: Optional[dict] = None) -> str:
     """Search the document knowledge base for relevant information.
 
-    Use this whenever the user asks a question that may be answered
-    by the ingested documents.
+    Args:
+        query: The search query
+        filters: Optional metadata filters decided from get_filter_context.
+                 Pass {} or omit to search without filtering.
     """
-    results = rag.retrieve(query, top_k=5)
+    results = rag.retrieve(query, top_k=5, filters=filters)
     if not results:
         return "No relevant documents found."
 
     chunks = []
     for doc in results:
         source = doc.metadata.get("file_name", "unknown")
-        company = doc.metadata.get("company_name", "")
-        year = doc.metadata.get("fiscal_year", "")
-        header = f"[{source}" + (f" | {company} {year}" if company else "") + "]"
+        meta_parts = [
+            f"{k}={str(v)[:100]}"
+            for k, v in doc.metadata.items()
+            if k != "file_name" and v not in (None, "", [])
+        ]
+        header = f"[{source}" + (f" | {', '.join(meta_parts)}" if meta_parts else "") + "]"
         chunks.append(f"{header}\n{doc.page_content}")
 
     return "\n\n---\n\n".join(chunks)
 ```
+
+**Agent reasoning flow:**
+
+```
+User: "creatine studies from 2023"
+
+1. Agent calls get_filter_context("creatine studies from 2023")
+   → sees research_focus values, publication_year: [2022, 2023, 2024]
+   → extracted: research_focus: "creatine", publication_year: 2023
+   → decides: {"publication_year": 2023}  (research_focus exact match uncertain)
+
+2. Agent calls search_documents("creatine studies from 2023", filters={"publication_year": 2023})
+   → clean retrieval with agent-decided filters
+```
+
+For multi-query tasks, the agent calls `get_filter_context` independently per sub-query — always fresh from Qdrant.
 
 ---
 
@@ -109,20 +150,7 @@ This prompt tells the agent exactly what data is available, so it can ask precis
 
 Pass the metadata-aware `SYSTEM_PROMPT` from the previous step so the agent knows what's in the knowledge base.
 
-=== "OpenAI"
-
-    ```python
-    from langchain.agents import create_agent
-    from langchain_openai import ChatOpenAI
-
-    model = ChatOpenAI(model="gpt-5.4-nano")
-
-    agent = create_agent(
-        model=model,
-        tools=[search_documents],
-        system_prompt=SYSTEM_PROMPT,
-    )
-    ```
+Register both tools and give the agent a minimal system prompt:
 
 === "Ollama (local)"
 
@@ -130,12 +158,21 @@ Pass the metadata-aware `SYSTEM_PROMPT` from the previous step so the agent know
     from langchain.agents import create_agent
     from langchain_ollama import ChatOllama
 
-    model = ChatOllama(model="qwen3.5:9b")
+    model = ChatOllama(model="qwen3.5:9b", base_url="http://localhost:11434")
 
     agent = create_agent(
         model=model,
-        tools=[search_documents],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[get_filter_context, search_documents],
+        system_prompt=(
+            "You are a helpful document assistant. "
+            "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+            "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+            "Use get_filter_context before search_documents when the query involves specific metadata (company, year, document type, etc.). "
+            "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+            "Always cite the source document in your answer."
+        ),
+    )
+
     )
     ```
 
@@ -149,8 +186,15 @@ Pass the metadata-aware `SYSTEM_PROMPT` from the previous step so the agent know
 
     agent = create_agent(
         model=model,
-        tools=[search_documents],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[get_filter_context, search_documents],
+        system_prompt=(
+            "You are a helpful document assistant. "
+            "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+            "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+            "Use get_filter_context before search_documents when the query involves specific metadata (company, year, document type, etc.). "
+            "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+            "Always cite the source document in your answer."
+        ),
     )
     ```
 
@@ -164,8 +208,15 @@ Pass the metadata-aware `SYSTEM_PROMPT` from the previous step so the agent know
 
     agent = create_agent(
         model=model,
-        tools=[search_documents],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[get_filter_context, search_documents],
+        system_prompt=(
+            "You are a helpful document assistant. "
+            "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+            "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+            "Use get_filter_context before search_documents when the query involves specific metadata (company, year, document type, etc.). "
+            "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+            "Always cite the source document in your answer."
+        ),
     )
     ```
 
@@ -174,8 +225,10 @@ Pass the metadata-aware `SYSTEM_PROMPT` from the previous step so the agent know
 ## 5. Ask a Question
 
 ```python
+from langchain_core.messages import HumanMessage
+
 response = agent.invoke({
-    "messages": [{"role": "user", "content": "What is Apple's total revenue for 2025?"}]
+    "messages": [HumanMessage("What is Apple's total revenue for 2025?")]
 })
 print(response["messages"][-1].content)
 ```
@@ -188,7 +241,8 @@ Add `InMemorySaver` to give the agent memory across turns within a session:
 
 ```python
 from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import InMemorySaver
 
 model = ChatOpenAI(model="gpt-5.4-nano")
@@ -199,7 +253,10 @@ agent = create_agent(
     tools=[search_documents],
     system_prompt=(
         "You are a helpful document assistant. "
-        "Use the search_documents tool to answer questions."
+        "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+        "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+        "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+        "Always cite the source document in your answer."
     ),
     checkpointer=checkpointer,
 )
@@ -208,14 +265,14 @@ config = {"configurable": {"thread_id": "session-1"}}
 
 # Turn 1
 response = agent.invoke(
-    {"messages": [{"role": "user", "content": "What is Apple's revenue?"}]},
+    {"messages": [HumanMessage("What is Apple's revenue?")]},
     config=config,
 )
 print(response["messages"][-1].content)
 
 # Turn 2 — agent remembers the previous question
 response = agent.invoke(
-    {"messages": [{"role": "user", "content": "How does that compare to Microsoft?"}]},
+    {"messages": [HumanMessage("How does that compare to Microsoft?")]},
     config=config,
 )
 print(response["messages"][-1].content)
@@ -228,32 +285,41 @@ print(response["messages"][-1].content)
 
 ## 7. Structured Output
 
-Get a typed response with answer, sources, and confidence:
+Get a typed response with answer, sources, and confidence using a Pydantic model passed directly as `response_format`:
 
 ```python
-from dataclasses import dataclass
+from typing import Literal
+from pydantic import BaseModel, Field
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_ollama import ChatOllama
 
-@dataclass
-class RAGResponse:
+class RAGResponse(BaseModel):
     """Structured agent response."""
-    answer: str
-    sources: list[str]
-    confidence: str  # "high" | "medium" | "low"
+    answer: str = Field(description="The answer to the user's question based on retrieved documents.")
+    sources: list[str] = Field(description="List of source document filenames used to generate the answer.")
+    confidence: Literal["high", "medium", "low"] = Field(
+        description="Confidence level: 'high' if strongly supported by sources, 'medium' if partially supported, 'low' if weakly supported."
+    )
 
-model = ChatOpenAI(model="gpt-5.4-nano")
+model = ChatOllama(model="qwen3.5:9b", base_url="http://localhost:11434")
 
 agent = create_agent(
     model=model,
-    tools=[search_documents],
-    system_prompt="You are a helpful document assistant. Use the search_documents tool to answer questions.",
-    response_format=ToolStrategy(RAGResponse),
+    tools=[search_documents, get_filter_context],
+    system_prompt=(
+        "You are a helpful document assistant. "
+        "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+        "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+        "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+        "Always cite the source document in your answer. "
+        "CRITICAL: You MUST output your final answer using the provided structured response format. Do not return plain text."
+    ),
+    response_format=RAGResponse,
 )
 
 response = agent.invoke({
-    "messages": [{"role": "user", "content": "What is Apple's net income for 2025?"}]
+    "messages": [HumanMessage("What is Apple's net income for 2025?")]
 })
 result = response["structured_response"]
 print(f"Answer:     {result.answer}")
@@ -261,9 +327,12 @@ print(f"Sources:    {', '.join(result.sources)}")
 print(f"Confidence: {result.confidence}")
 ```
 
+!!! tip "Pydantic `Field` descriptions matter"
+    The `description` on each field is part of the schema sent to the model. Clear descriptions — especially on constrained fields like `confidence` — significantly improve output reliability.
+
 ---
 
-## 8. Full Working Example
+## 7. Full Working Example
 
 Save as `examples/rag_agent.py` and run:
 
@@ -283,52 +352,65 @@ Place PDF files in examples/data/ then run:
   python examples/rag_agent.py
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from typing import Optional
 
 from langchain.agents import create_agent
 from langchain.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import InMemorySaver
 
 from ragwire import RAGWire, setup_logging
 
 logger = setup_logging(log_level="INFO")
 
-CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-DATA_DIR = Path(__file__).parent / "data"
-
 
 # ------------------------------------------------------------------ #
 # 1. Pipeline
 # ------------------------------------------------------------------ #
-rag = RAGWire(str(CONFIG_PATH))
-stats = rag.ingest_directory(str(DATA_DIR))
+rag = RAGWire("config.yaml")
+stats = rag.ingest_directory("data/")
 logger.info(f"Ingested {stats['processed']} docs, {stats['chunks_created']} chunks")
 
 
 # ------------------------------------------------------------------ #
-# 2. Retrieval tool
+# 2. Tools
 # ------------------------------------------------------------------ #
 @tool
-def search_documents(query: str) -> str:
+def get_filter_context(query: str) -> str:
+    """Get available metadata fields, stored values, and filter suggestions for a query.
+
+    Call this before search_documents when the query involves specific metadata
+    (company, year, document type, etc.). Use the returned context to decide
+    what filters to pass to search_documents.
+
+    Skip this for purely semantic queries with no metadata intent.
+    """
+    return rag.get_filter_context(query)
+
+
+@tool
+def search_documents(query: str, filters: Optional[dict] = None) -> str:
     """Search the document knowledge base for relevant information.
 
-    Use this whenever the user asks a question that may be answered
-    by the ingested documents.
+    Args:
+        query: The search query
+        filters: Optional metadata filters decided from get_filter_context.
+                 Pass {} or omit to search without filtering.
     """
-    results = rag.retrieve(query, top_k=5)
+    results = rag.retrieve(query, top_k=5, filters=filters)
     if not results:
         return "No relevant documents found."
 
     chunks = []
     for doc in results:
         source = doc.metadata.get("file_name", "unknown")
-        company = doc.metadata.get("company_name", "")
-        year = doc.metadata.get("fiscal_year", "")
-        header = f"[{source}" + (f" | {company} {year}" if company else "") + "]"
+        meta_parts = [
+            f"{k}={str(v)[:100]}"
+            for k, v in doc.metadata.items()
+            if k != "file_name" and v not in (None, "", [])
+        ]
+        header = f"[{source}" + (f" | {', '.join(meta_parts)}" if meta_parts else "") + "]"
         chunks.append(f"{header}\n{doc.page_content}")
 
     return "\n\n---\n\n".join(chunks)
@@ -337,16 +419,18 @@ def search_documents(query: str) -> str:
 # ------------------------------------------------------------------ #
 # 3. Agent with memory
 # ------------------------------------------------------------------ #
-model = ChatOpenAI(model="gpt-5.4-nano")
+model = ChatOllama(model="qwen3.5:9b", base_url="http://localhost:11434")
 checkpointer = InMemorySaver()
 
 agent = create_agent(
     model=model,
-    tools=[search_documents],
+    tools=[get_filter_context, search_documents],
     system_prompt=(
         "You are a helpful financial document assistant. "
-        "Use the search_documents tool to retrieve relevant information "
-        "from the knowledge base before answering questions. "
+        "For complex questions, break them down into simple sub-questions and answer each one before forming a final answer. "
+        "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+        "Use get_filter_context before search_documents when the query involves specific metadata (company, year, document type, etc.). "
+        "If no relevant documents are found, say so — do not guess or fabricate an answer. "
         "Always cite the source document in your answer."
     ),
     checkpointer=checkpointer,
@@ -368,7 +452,7 @@ while True:
         continue
 
     response = agent.invoke(
-        {"messages": [{"role": "user", "content": question}]},
+        {"messages": [HumanMessage(question)]},
         config=config,
     )
     print(f"\nAgent: {response['messages'][-1].content}\n")

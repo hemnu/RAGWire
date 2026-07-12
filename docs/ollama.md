@@ -73,6 +73,7 @@ vectorstore:
 retriever:
   search_type: "hybrid"
   top_k: 5
+  auto_filter: false   # set true to enable LLM-based filter extraction from every query
 ```
 
 ## 4. Python Usage
@@ -105,6 +106,7 @@ Use `create_agent` to wrap the retriever as a tool and build a conversational Q&
 ```python
 from langchain.agents import create_agent
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import InMemorySaver
 from ragwire import RAGWire
@@ -126,13 +128,18 @@ def search_documents(query: str) -> str:
 agent = create_agent(
     model=ChatOllama(model="qwen3.5:9b"),
     tools=[search_documents],
-    system_prompt="You are a helpful document assistant. Use search_documents to answer questions.",
+    system_prompt=(
+        "You are a helpful document assistant. "
+        "Always use search_documents to retrieve information before answering — never answer from general knowledge. "
+        "If no relevant documents are found, say so — do not guess or fabricate an answer. "
+        "Always cite the source document in your answer."
+    ),
     checkpointer=InMemorySaver(),
 )
 
 config = {"configurable": {"thread_id": "session-1"}}
 response = agent.invoke(
-    {"messages": [{"role": "user", "content": "What is the total revenue?"}]},
+    {"messages": [HumanMessage("What is the total revenue?")]},
     config=config,
 )
 print(response["messages"][-1].content)

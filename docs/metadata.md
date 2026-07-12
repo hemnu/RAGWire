@@ -9,7 +9,11 @@ Understanding metadata is critical for building precise RAG applications. RAGWir
 Every chunk stored in Qdrant carries the following metadata fields:
 
 ### LLM-Extracted Fields
-These are extracted once per document from the first chunk using your configured LLM.
+Extracted once per document from the first chunk using your configured LLM.
+
+!!! note "Default schema — Finance"
+    The fields below are the **default** metadata schema, designed for financial documents. You are not locked into these fields.
+    RAGWire lets you define any fields you need via a simple YAML file. See [Custom Metadata](custom_metadata.md) for details.
 
 | Field | Type | Example | Description |
 |---|---|---|---|
@@ -120,20 +124,60 @@ Use these to apply precise filters when answering questions.
 
 ## Filtering at Query Time
 
-RAGWire applies filters in two ways:
+RAGWire provides two ways to inspect fields — use the right one for your purpose:
 
-- **Explicit filters** — pass a `filters` dict directly; LLM extraction is skipped
-- **Auto-filter** — pass nothing; the configured LLM extracts filters from the query automatically
+| Method | Returns | Use for |
+|---|---|---|
+| `rag.filter_fields` | Semantic/LLM-extracted fields only | Building filter prompts, agent prompts |
+| `rag.discover_metadata_fields()` | All fields including system fields | Collection inspection, debugging |
 
 ```python
-# Explicit — LLM extraction skipped
-results = rag.retrieve("What is the revenue?", filters={"company_name": "apple"})
+# Filterable fields only — use these for filter prompts
+rag.filter_fields
+# → ['company_name', 'doc_type', 'fiscal_quarter', 'fiscal_year']
 
-# Auto — LLM extracts {"company_name": "apple", "fiscal_year": 2025} from the query
-results = rag.retrieve("What is Apple's revenue for 2025?")
+# All fields — includes file_hash, chunk_id, source, created_at, etc.
+rag.discover_metadata_fields()
+# → ['company_name', 'doc_type', 'fiscal_year', 'file_name', 'file_hash', 'chunk_id', ...]
+
+# Get stored values for filterable fields
+rag.get_field_values(rag.filter_fields)
+# → {'company_name': ['apple', 'microsoft'], 'doc_type': ['10-k', '10-q'], ...}
+
+# Raise the limit for high-cardinality fields (default limit=50)
+rag.get_field_values("file_name", limit=200)
+# → ['Apple_10k_2025.pdf', 'Microsoft_10k_2025.pdf', ...]
 ```
 
-The available filter fields match your metadata schema — financial defaults (`company_name`, `doc_type`, `fiscal_quarter`, `fiscal_year`) or your custom fields from `metadata.yaml`.
+Results are ordered by frequency — most common values first.
+
+---
+
+## Filtering at Query Time
+
+RAGWire supports three filtering modes:
+
+| Mode | How | When to use |
+|---|---|---|
+| **Explicit** | Pass `filters=` dict to `retrieve()` | Programmatic pipelines, known inputs |
+| **Auto-filter** | Set `auto_filter: true` in config | Simple chatbots, no agent involved |
+| **Agent-controlled** | Call `extract_filters()` or `get_filter_context()` manually | Agents that need to reason about filters |
+
+!!! note "auto_filter is off by default"
+    No filter extraction happens automatically unless `auto_filter: true` is set in `config.yaml`. For agents, keep the default and use `extract_filters()` or `get_filter_context()` to control extraction explicitly.
+
+```python
+# Explicit — LLM extraction skipped entirely
+results = rag.retrieve("What is the revenue?", filters={"company_name": "apple"})
+
+# Auto-filter — requires auto_filter: true in config.yaml
+results = rag.retrieve("What is Apple's revenue for 2025?")
+
+# Agent-controlled — extract, inspect, adjust, then retrieve
+filters = rag.extract_filters("What is Apple's revenue for 2025?")
+# → {"company_name": "apple", "fiscal_year": 2025}
+results = rag.retrieve("What is Apple's revenue for 2025?", filters=filters)
+```
 
 ---
 
@@ -160,24 +204,28 @@ results = rag.retrieve(
 ### Filter by fiscal year
 
 ```python
-# fiscal_year is stored as a list — pass the year as an int
+# Single year — pass as int
 results = rag.retrieve(
     "What is the net income?",
     top_k=5,
     filters={"fiscal_year": 2025}
 )
+
+# Multiple years — matches documents covering ANY of the years (OR logic)
+results = rag.retrieve(
+    "Compare net income across 2023 and 2024",
+    top_k=10,
+    filters={"fiscal_year": [2023, 2024]}
+)
 ```
 
-### Filter by company + year (combined)
+### Combined filters
 
 ```python
 results = rag.retrieve(
     "What is the revenue breakdown by segment?",
     top_k=5,
-    filters={
-        "company_name": "apple",
-        "fiscal_year": 2025
-    }
+    filters={"company_name": "apple", "fiscal_year": 2025}
 )
 ```
 
@@ -195,7 +243,7 @@ results = rag.retrieve(
 
 ## Filters in Hybrid Search
 
-Filters also work with `hybrid_search()`:
+Filters work identically with `hybrid_search()`:
 
 ```python
 results = rag.hybrid_search(
@@ -207,90 +255,72 @@ results = rag.hybrid_search(
 
 ---
 
-## Telling an External LLM What Metadata Is Available
+## Agent-Controlled Filtering
 
-When building a RAG chatbot, pass the schema to your LLM so it can decide what filters to apply before querying.
+For agents, keep `auto_filter` off and use two tools — one for metadata awareness, one for retrieval:
+
+### Two-tool pattern (recommended)
 
 ```python
-METADATA_SCHEMA = """
-Available metadata fields for filtering RAG queries:
+from typing import Optional
 
-LLM-extracted (from document content):
-- company_name (str): Company name in lowercase. Example: "apple", "microsoft"
-- doc_type (str): Document type. Values: "10-k", "10-q", "8-k"
-- fiscal_quarter (str or null): Quarter. Values: "q1", "q2", "q3", "q4"
-- fiscal_year (list[int]): Fiscal year(s). Example: [2025]
+@tool
+def get_filter_context(query: str) -> str:
+    """Get available metadata fields, stored values, and filter suggestions for a query.
 
-File-level:
-- file_name (str): Original filename. Example: "Apple_10k_2025.pdf"
-- file_type (str): File extension. Example: "pdf"
-- chunk_index (int): Chunk position within the document (0-based)
-- total_chunks (int): Total chunks in the document
+    Call this before search_documents when the query involves specific metadata
+    (company, year, document type, etc.). Use it to decide what filters to apply.
+    Safe to call per sub-query in multi-query flows — always fresh from Qdrant.
+    """
+    return rag.get_filter_context(query)
 
-Use these fields to filter retrieved chunks when the user query specifies
-a particular company, document type, or time period.
-"""
-
-SYSTEM_PROMPT = f"""
-You are a financial document assistant.
-You have access to a RAG pipeline with the following metadata schema:
-
-{METADATA_SCHEMA}
-
-When answering questions, extract any filters from the user query
-(e.g. company name, year, document type) and apply them.
-"""
+@tool
+def search_documents(query: str, filters: Optional[dict] = None) -> str:
+    """Search the document knowledge base. Pass filters decided from get_filter_context."""
+    results = rag.retrieve(query, top_k=5, filters=filters)
+    if not results:
+        return "No relevant documents found."
+    return "\n\n---\n\n".join(
+        f"[{doc.metadata.get('file_name', 'unknown')}]\n{doc.page_content}"
+        for doc in results
+    )
 ```
 
-### Full example — LLM-driven filter extraction
+Agent flow:
+```
+1. Agent calls get_filter_context("Apple revenue 2025")
+   → sees fields, stored values, extracted: {"company_name": "apple", "fiscal_year": 2025}
+   → decides filters
 
-```python
-from ragwire import RAGWire
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-import json
+2. Agent calls search_documents("Apple revenue 2025", filters={"company_name": "apple", "fiscal_year": 2025})
+```
 
 rag = RAGWire("config.yaml")
 llm = ChatOpenAI(model="gpt-5.4-nano")
 
-FILTER_PROMPT = """
-Given the user query below, extract metadata filters as JSON.
-Only include fields if clearly mentioned. Return {} if no filters apply.
+The agent calls `get_filter_context` only when metadata is relevant — skips it for purely semantic queries. For multi-query tasks each sub-query gets its own fresh context.
 
-Available fields: company_name (str), doc_type (str), fiscal_year (int), fiscal_quarter (str)
+### What `get_filter_context()` returns
 
-User query: {query}
+```
+## RAGWire Filter Context
 
-Filters (JSON only):
-"""
+### Available Metadata Fields and Stored Values
+- **company_name**: ['apple', 'microsoft', 'google']
+- **doc_type**: ['10-k', '10-q']
+- **fiscal_year**: [2023, 2024, 2025]
 
-def query_with_filters(user_query: str, top_k: int = 5):
-    # Step 1: Ask LLM to extract filters from the query
-    prompt = ChatPromptTemplate.from_template(FILTER_PROMPT)
-    chain = prompt | llm
-    response = chain.invoke({"query": user_query})
+### Extracted Filters from Query
+- **company_name**: `apple`
+- **fiscal_year**: `2025`
 
-    try:
-        filters = json.loads(response.content.strip())
-    except Exception:
-        filters = {}
-
-    print(f"Extracted filters: {filters}")
-
-    # Step 2: Retrieve with filters
-    results = rag.retrieve(user_query, top_k=top_k, filters=filters or None)
-
-    return results
-
-
-# Example usage
-results = query_with_filters("What is Apple's revenue for fiscal year 2025?")
-for doc in results:
-    print(doc.metadata.get("company_name"), doc.metadata.get("fiscal_year"))
-    print(doc.page_content[:200])
-    print()
+### Instructions
+1. Review the extracted filters above.
+2. If an extracted value does not match or closely relate to any stored value, adjust or drop that filter.
+3. If the query has no clear metadata intent, pass an empty dict {} as filters.
+4. Pass the final filters dict to the retrieval tool as filters=.
 ```
 
 ---
 
-For custom metadata fields (legal, HR, or any non-financial domain), see [Custom Metadata](custom_metadata.md).
+For custom metadata fields (legal, HR, medical, or any non-financial domain), see [Custom Metadata](custom_metadata.md).

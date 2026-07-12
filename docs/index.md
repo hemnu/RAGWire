@@ -6,6 +6,10 @@ RAGWire handles the full RAG pipeline — from loading raw documents to storing 
 
 ---
 
+![RAGWire High-Level Overview](assets/ragwire_highlevel.jpg)
+
+---
+
 ## Features
 
 - **Document Loading** — PDF, DOCX, XLSX, PPTX and more via MarkItDown
@@ -15,6 +19,12 @@ RAGWire handles the full RAG pipeline — from loading raw documents to storing 
 - **Qdrant Vector Store** — dense, sparse, and hybrid search
 - **Advanced Retrieval** — similarity, MMR, and hybrid search
 - **SHA256 Deduplication** — at both file and chunk level — no duplicate ingestion
+
+---
+
+## Architecture
+
+![RAGWire Architecture](assets/RAGWire-block-diagram.png)
 
 ---
 

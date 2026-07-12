@@ -1,35 +1,48 @@
 # Build a Metadata-Aware Filtered Chatbot
 
-Combine auto-filter with a metadata-aware system prompt so the agent knows what data is available and can filter precisely.
+The agent is told what companies, doc types, and fiscal years exist in the collection — then it decides which filters to pass when calling the search tool. This gives the agent full control over retrieval precision.
 
 ```python
+from typing import Optional
 from ragwire import RAGWire
 from langchain.agents import create_agent
 from langchain.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 rag = RAGWire("config.yaml")
 
-# Discover what's in the collection
-values = rag.get_field_values(["company_name", "doc_type", "fiscal_year"])
+# Dynamically discover all filterable fields and their values
+fields = rag.get_metadata_keys()
+values = rag.get_field_values(fields)
+filter_context = "\n".join(f"- {field}: {vals}" for field, vals in values.items() if vals)
 
 SYSTEM_PROMPT = f"""
 You are a financial document assistant.
-Use the search_documents tool to answer questions from the knowledge base.
+Always use search_documents to retrieve information before answering — never answer from general knowledge.
+If no relevant documents are found, say so — do not guess or fabricate an answer.
+Always cite the source document in your answer.
 
-Available data:
-- Companies  : {values['company_name']}
-- Doc types  : {values['doc_type']}
-- Fiscal years: {values['fiscal_year']}
+Available data in the knowledge base:
+{filter_context}
 
-The retrieval system automatically filters by company, year, and doc type
-when mentioned in the query — you don't need to do anything special.
+When calling search_documents, pass the appropriate filters based on what the user is asking about.
+Match filter values exactly as shown above.
+Only pass filters that are clearly relevant — omit filters when the query is broad.
 """
 
 @tool
-def search_documents(query: str) -> str:
-    """Search the financial document knowledge base."""
-    results = rag.retrieve(query, top_k=5)
+def search_documents(query: str, filters: Optional[dict] = None) -> str:
+    """
+    Search the financial document knowledge base.
+
+    Args:
+        query: The search query.
+        filters: Optional metadata filters (e.g. {"company_name": "apple inc.", "fiscal_year": 2025}).
+    """
+    results = rag.retrieve(query, top_k=5, filters=filters)
+```
+
     if not results:
         return "No relevant documents found."
     chunks = []
@@ -53,8 +66,11 @@ print(response["messages"][-1].content)
 ## Why This Works
 
 1. `get_field_values()` fetches the actual values stored in your collection — no hardcoding
-2. The system prompt tells the LLM exactly what companies, years, and doc types are available
-3. When the user asks "Apple's 2025 revenue", `retrieve()` auto-filters to `{company_name: "apple", fiscal_year: 2025}` — the agent doesn't need to pass filters manually
+2. The system prompt tells the agent exactly what companies, years, and doc types exist
+3. The agent reads the query, decides which filters apply, and passes them explicitly to `search_documents`
+4. `retrieve()` applies those filters directly — no guessing, no LLM-based auto-extraction
+
+This is more reliable than `auto_filter` because the agent reasons about filters using the full conversation context, not just the current query string.
 
 ## Add Multi-Turn Memory
 
@@ -81,6 +97,7 @@ response = agent.invoke(
     {"messages": [{"role": "user", "content": "How does that compare to Microsoft?"}]},
     config=config,
 )
+
 ```
 
 See [RAG Agent](../rag_agent.md) for the full guide including structured output and a complete working example.

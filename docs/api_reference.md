@@ -118,8 +118,11 @@ Each `Document` has:
 
 **Filter behaviour:**
 
-- If `filters` is passed → used as-is, no LLM call
-- If `filters` is not passed → LLM automatically extracts filters from the query
+- If `filters` is passed → used as-is, no LLM call (always, regardless of `auto_filter` setting)
+- If `filters` is not passed and `auto_filter: true` in config → LLM extracts filters from the query
+- If `filters` is not passed and `auto_filter: false` (default) → no filtering, pure semantic search
+
+**When to use auto-filter vs explicit filters:** Use explicit filters in programmatic pipelines where you control the inputs (faster, zero LLM overhead). Enable `auto_filter` in simple user-facing chatbots. For agents, keep `auto_filter: false` and use `rag.extract_filters(query)` to give the agent full control over whether and how to apply filters.
 
 **When to use auto-filter vs explicit filters:** Use explicit filters in programmatic pipelines where you control the inputs (faster, zero LLM overhead). Use auto-filter in user-facing chatbots where the user types natural language queries and you want the system to figure out the right filters automatically.
 
@@ -131,7 +134,10 @@ results = rag.retrieve(
     filters={"company_name": "apple", "fiscal_year": 2025}
 )
 
-# No filters passed — LLM extracts {"company_name": "apple", "fiscal_year": 2025} from the query
+# auto_filter: true in config — LLM extracts {"company_name": "apple", "fiscal_year": 2025}
+results = rag.retrieve("What is Apple's net income for 2025?")
+
+# auto_filter: false (default) — pure semantic search, no filter extraction
 results = rag.retrieve("What is Apple's net income for 2025?")
 
 for doc in results:
@@ -153,7 +159,31 @@ Perform hybrid search combining dense (semantic) and sparse (keyword) vectors. R
 
 **Returns:** `list[Document]`
 
+!!! warning "Hybrid search requires sparse vectors"
+    `hybrid_search()` only performs true hybrid (dense + sparse) search when **both** conditions are met:
+
+    1. `use_sparse: true` in `config.yaml` — collection must be created with sparse vector support
+    2. `pip install fastembed` — required for sparse encoding
+
+    If either is missing, the call silently falls back to **dense-only similarity search**. There is no error raised.
+    If your collection was created with `use_sparse: false`, you must set `force_recreate: true` and re-ingest to enable hybrid search.
+
+**`retrieve()` vs `hybrid_search()` — when to use which:**
+
+| | `retrieve()` | `hybrid_search()` |
+|---|---|---|
+| Search type | Whatever is set in `config.yaml` (`similarity`, `mmr`, or `hybrid`) | Always hybrid (dense + sparse), regardless of config |
+| Auto-filter | Only when `auto_filter: true` in config (default `false`) | Same — respects `auto_filter` setting |
+| `top_k` default | From `config.yaml` | `k=5` parameter |
+| Typical use | Primary method for all RAG flows | Override to force hybrid on a single call |
+
+If your `config.yaml` already has `search_type: "hybrid"`, both methods produce identical results. Use `hybrid_search()` only when your config is set to `similarity` or `mmr` and you want to force hybrid for a specific call.
+
 ```python
+# Use retrieve() in most cases — honours config search type
+results = rag.retrieve("Apple revenue fiscal 2025", top_k=5)
+
+# Use hybrid_search() to force hybrid regardless of config
 results = rag.hybrid_search(
     "Apple revenue fiscal 2025",
     k=5,
@@ -163,9 +193,99 @@ results = rag.hybrid_search(
 
 ---
 
+#### `rag.extract_filters(query)`
+
+Extract metadata filters from a natural language query without triggering retrieval. Returns the raw extracted dict so an agent can inspect, adjust, or discard before passing to `retrieve()`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | `str` | Yes | Natural language query |
+
+**Returns:** `dict` of extracted filters, or `None` if nothing was extracted.
+
+!!! note
+    This method always runs regardless of the `auto_filter` config setting. It gives agents explicit control — call it manually, decide what to do, then pass the result to `retrieve()`.
+
+```python
+# Agent workflow — full control over filters
+filters = rag.extract_filters("muscle building studies from 2023")
+# → {"research_focus": "muscle building", "publication_year": 2023}
+
+# Agent validates against stored values
+stored = rag.get_field_values(rag.filter_fields)
+if filters.get("research_focus") not in stored.get("research_focus", []):
+    filters.pop("research_focus")  # drop uncertain filter, rely on semantic search
+
+results = rag.retrieve("muscle building studies from 2023", filters=filters)
+```
+
+---
+
+#### `rag.get_filter_context(query, limit)`
+
+Build a ready-made markdown prompt block for an agent — contains available metadata fields, their stored values, the filters extracted from the current query, and instructions for the agent on how to act on them. Append or prepend to your agent's task prompt.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `query` | `str` | Yes | — | Natural language query |
+| `limit` | `int` | No | `50` | Max stored values to show per field |
+
+**Returns:** `str` — formatted markdown block ready to inject into an agent prompt.
+
+```python
+filter_context = rag.get_filter_context("muscle building studies from 2023")
+agent_prompt = filter_context + "\n\n" + your_task_prompt
+```
+
+The returned block looks like:
+
+```
+## RAGWire Filter Context
+
+### Available Metadata Fields and Stored Values
+- **research_focus**: ["muscle-growth", "endurance", "recovery", ...]
+- **publication_year**: [2022, 2023, 2024]
+- **authors**: ["john smith", "jane doe", ...]
+
+### Extracted Filters from Query
+- **research_focus**: `muscle building`
+- **publication_year**: `2023`
+
+### Instructions
+1. Review the extracted filters above.
+2. If an extracted value does not match or closely relate to any stored value, adjust or drop that filter.
+3. If the query has no clear metadata intent, pass an empty dict {} as filters.
+4. Pass the final filters dict to the retrieval tool as filters=.
+```
+
+!!! note "Typical agent workflow"
+    Use `get_filter_context()` to give the agent full situational awareness. The agent can then call `rag.retrieve(query, filters=adjusted_filters)` with a well-informed decision on which filters to apply.
+
+---
+
+#### `rag.filter_fields`
+
+Property. Returns the metadata fields used for filtering and auto-filter extraction — the semantic/LLM-extracted fields only. System fields like `file_hash`, `chunk_id`, `source`, `chunk_index`, `created_at` are excluded.
+
+Use this when building dynamic filter prompts for an LLM agent. Using `discover_metadata_fields()` instead would include system fields that have no value as filters.
+
+```python
+fields = rag.filter_fields
+# Default: ['company_name', 'doc_type', 'fiscal_quarter', 'fiscal_year']
+# Custom:  whatever fields are defined in your metadata.yaml
+
+values = rag.get_field_values(fields)
+# → {'company_name': ['apple', 'microsoft'], 'doc_type': ['10-k'], ...}
+```
+
+---
+
 #### `rag.discover_metadata_fields()`
 
-Return all metadata field names present in the collection. Scrolls one point — fast regardless of collection size.
+Return **all** metadata field names present in the collection, including system fields. Scrolls one point — fast regardless of collection size.
+
+Use this for collection inspection or debugging. For building filter prompts, use `rag.filter_fields` instead.
+
 
 **Returns:** `list[str]`
 
@@ -204,14 +324,32 @@ rag.get_field_values(["company_name", "doc_type"])
 rag.get_field_values("file_name", limit=200)
 # → ['Apple_10k_2025.pdf', 'Microsoft_10k_2025.pdf', ...]
 
-# Typical agent workflow
-fields = rag.discover_metadata_fields()
-values = rag.get_field_values(["company_name", "doc_type"])
+# Typical agent workflow — use filter_fields, not discover_metadata_fields()
+values = rag.get_field_values(rag.filter_fields)
 results = rag.retrieve("revenue", filters={"company_name": values["company_name"][0]})
 ```
 
 ---
 
+#### `rag.extract_metadata(text)`
+
+Extract structured metadata from text using the configured LLM.
+
+Automatically passes stored collection values so the LLM reuses existing entity names (e.g. "apple inc.") rather than extracting inconsistent variants ("apple", "Apple Inc."). This grounding is applied transparently — you do not need to pass stored values manually.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `text` | `str` | Yes | Document text to extract metadata from (first 10,000 chars used) |
+
+**Returns:** `dict`
+
+```python
+metadata = rag.extract_metadata(open("report.txt").read())
+print(metadata)
+# {'company_name': 'apple inc.', 'doc_type': '10-k', 'fiscal_quarter': None, 'fiscal_year': [2025]}
+```
+
+---
 #### `rag.get_stats()`
 
 Get statistics about the current collection.
@@ -231,6 +369,146 @@ Get statistics about the current collection.
 stats = rag.get_stats()
 print(f"Collection: {stats['collection_name']}, Chunks: {stats['total_documents']}")
 ```
+
+---
+
+---
+
+## Config Reference — `llm` and `embeddings`
+
+All parameters below are set in `config.yaml` and read automatically by `RAGWire` at startup.
+
+---
+
+### `llm` section
+
+Controls the LLM used for metadata extraction (and filter extraction during retrieval).
+
+| Key | Required | Default | Description |
+|---|---|---|---|
+| `provider` | Yes | — | `ollama`, `openai`, `google`, `groq`, `anthropic` |
+| `model` | Yes | — | Model name (e.g. `qwen3.5:9b`, `gpt-4o-mini`) |
+| `base_url` | Ollama only | `http://localhost:11434` | Ollama server URL |
+| `num_ctx` | Ollama only | LangChain default | Context window size — only set this if you need to override the default |
+| `api_key` | Google / Groq / Anthropic | — | API key (or use `${ENV_VAR}` syntax) |
+
+!!! note "OpenAI"
+    OpenAI reads `OPENAI_API_KEY` from the environment automatically — no `api_key` field needed in config.
+
+```yaml
+# Ollama
+llm:
+  provider: "ollama"
+  model: "qwen3.5:9b"
+  base_url: "http://localhost:11434"
+  num_ctx: 16384
+
+# OpenAI
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+
+# Google Gemini
+llm:
+  provider: "google"
+  model: "gemini-2.5-flash"
+  api_key: "${GOOGLE_API_KEY}"
+
+# Groq
+llm:
+  provider: "groq"
+  model: "llama-3.3-70b-versatile"
+  api_key: "${GROQ_API_KEY}"
+
+# Anthropic
+llm:
+  provider: "anthropic"
+  model: "claude-haiku-4-5-20251001"
+  api_key: "${ANTHROPIC_API_KEY}"
+```
+
+---
+
+### `embeddings` section
+
+Controls the embedding model used to encode documents and queries into vectors.
+
+| Key | Required | Default | Description |
+|---|---|---|---|
+| `provider` | Yes | — | `ollama`, `openai`, `google`, `huggingface`, `fastembed` |
+| `model` | Most providers | provider default | Embedding model name |
+| `base_url` | Ollama only | `http://localhost:11434` | Ollama server URL |
+| `num_ctx` | Ollama only | LangChain default | Context window size — only set this if you need to override the default |
+| `api_key` | Google only | — | API key (or use `${ENV_VAR}` syntax) |
+| `model_name` | HuggingFace / FastEmbed only | see below | Model identifier (uses `model_name` key, not `model`) |
+| `model_kwargs` | HuggingFace only | `{}` | Passed to the HuggingFace model constructor (e.g. `{"device": "cpu"}`) |
+| `encode_kwargs` | HuggingFace only | `{}` | Passed to the encode call (e.g. `{"normalize_embeddings": true}`) |
+
+**Default models per provider:**
+
+| Provider | Default model |
+|---|---|
+| `ollama` | `nomic-embed-text` |
+| `openai` | `text-embedding-3-small` |
+| `google` | `models/embedding-001` |
+| `huggingface` | `sentence-transformers/all-MiniLM-L6-v2` |
+| `fastembed` | `BAAI/bge-small-en-v1.5` |
+
+```yaml
+# Ollama
+embeddings:
+  provider: "ollama"
+  model: "nomic-embed-text"
+  base_url: "http://localhost:11434"
+  num_ctx: 16384
+
+# OpenAI
+embeddings:
+  provider: "openai"
+  model: "text-embedding-3-small"
+
+# Google Gemini
+embeddings:
+  provider: "google"
+  model: "models/gemini-embedding-001"
+  api_key: "${GOOGLE_API_KEY}"
+
+# HuggingFace (local)
+embeddings:
+  provider: "huggingface"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  model_kwargs:
+    device: "cpu"
+  encode_kwargs:
+    normalize_embeddings: true
+
+# FastEmbed (local, sparse-capable)
+embeddings:
+  provider: "fastembed"
+  model_name: "BAAI/bge-small-en-v1.5"
+```
+
+---
+
+### `retriever` section
+
+Controls retrieval behaviour.
+
+| Key | Required | Default | Description |
+|---|---|---|---|
+| `search_type` | No | `"similarity"` | `"similarity"` \| `"mmr"` \| `"hybrid"` (hybrid requires `use_sparse: true`) |
+| `top_k` | No | `5` | Number of results returned by `retrieve()` |
+| `auto_filter` | No | `false` | If `true`, LLM automatically extracts metadata filters from every query passed to `retrieve()` / `hybrid_search()`. If `false`, no filter extraction happens unless `filters=` is passed explicitly or `rag.extract_filters()` is called manually. |
+
+```yaml
+retriever:
+  search_type: "hybrid"
+  top_k: 5
+  auto_filter: false   # set true to enable automatic filter extraction from queries
+```
+
+!!! note "Agent use case"
+    Keep `auto_filter: false` when an agent is driving retrieval. Use `rag.extract_filters(query)` to let the agent inspect and adjust filters before calling `retrieve(filters=...)`.
 
 ---
 
@@ -422,24 +700,49 @@ Extract structured metadata from document text using an LLM.
 from ragwire import MetadataExtractor
 ```
 
-#### `MetadataExtractor(llm, prompt_template)`
+#### `MetadataExtractor(llm, schema_model)`
+
+Uses `with_structured_output` with a Pydantic model for reliable, type-safe extraction — no manual JSON parsing.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `llm` | `Any` | Yes | LangChain chat model instance |
-| `prompt_template` | `str` | No | Custom prompt (uses financial default if not set) |
+| `schema_model` | `BaseModel` | No | Pydantic model defining fields and types. Defaults to `FinancialMetadata` |
 
-#### `extractor.extract(text)`
+```python
+from ragwire import MetadataExtractor, FinancialMetadata
+from langchain_ollama import ChatOllama
+
+llm = ChatOllama(model="qwen3.5:9b", base_url="http://localhost:11434")
+
+# Default — uses FinancialMetadata schema (company_name, doc_type, fiscal_quarter, fiscal_year)
+extractor = MetadataExtractor(llm)
+
+# Custom Pydantic schema
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class MySchema(BaseModel):
+    organization: Optional[str] = Field(None, description="Organization name in lowercase")
+    doc_type: Optional[str] = Field(None, description="contract | policy | report")
+    effective_year: Optional[int] = Field(None, description="Year the document is effective")
+    tags: Optional[List[str]] = Field(None, description="List of topic tags")
+
+extractor = MetadataExtractor(llm, schema_model=MySchema)
+```
+
+#### `extractor.extract(text, stored_values)`
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `text` | `str` | Yes | Document text (first 10,000 chars used) |
+| `stored_values` | `dict` | No | Existing field values from the collection. When provided, the LLM reuses stored names (e.g. `"apple inc."`) instead of extracting inconsistent variants. Pass `rag.get_field_values(fields)` or use `rag.extract_metadata()` which injects this automatically. |
 
 **Returns:** `dict`
 
 ```python
 {
-    "company_name": "apple",
+    "company_name": "apple inc.",
     "doc_type": "10-k",
     "fiscal_quarter": None,
     "fiscal_year": [2025]
@@ -447,18 +750,30 @@ from ragwire import MetadataExtractor
 ```
 
 ```python
+# Basic extraction
+
+```python
 from langchain_openai import ChatOpenAI
 from ragwire import MetadataExtractor
 
 llm = ChatOpenAI(model="gpt-5.4-nano")
 extractor = MetadataExtractor(llm)
+
 metadata = extractor.extract(document_text)
+
+# With grounding — LLM reuses stored entity names
+```
+metadata = extractor.extract(document_text)
+
+# With grounding — LLM reuses stored entity names
+stored = rag.get_field_values(rag.filter_fields)
+metadata = extractor.extract(document_text, stored_values=stored)
 print(metadata)
 ```
 
 #### `MetadataExtractor.from_yaml(llm, yaml_path)`
 
-Create an extractor configured from a YAML file. The YAML defines fields (auto-builds the prompt) or a full `prompt_template`.
+Create an extractor from a YAML file. Builds a Pydantic model dynamically from the field definitions.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -472,19 +787,7 @@ extractor = MetadataExtractor.from_yaml(llm, "metadata.yaml")
 metadata = extractor.extract(document_text)
 ```
 
-See [Custom Metadata via YAML](custom_metadata.md#custom-metadata-via-yaml-file) for the YAML format.
-
----
-
-#### `MetadataExtractor.build_prompt_from_fields(fields)`
-
-Build a JSON extraction prompt from a list of field definitions. Called automatically by `from_yaml()`.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `fields` | `list[dict]` | Each dict: `name` (str), `description` (str), `values` (list, optional) |
-
-**Returns:** `str` — prompt template with `{content}` placeholder.
+See [Custom Metadata](custom_metadata.md) for the YAML format including `type` and `values` field options.
 
 ---
 
@@ -665,7 +968,7 @@ values = store.get_field_values(["file_name"], limit=200)
 ```
 
 !!! note "Using `RAGWire` instead?"
-    If you're using `RAGWire`, prefer `rag.discover_metadata_fields()` and `rag.get_field_values()` — they are thin wrappers over these same methods and don't require you to manage the `QdrantStore` instance directly.
+    If you're using `RAGWire`, prefer `rag.filter_fields` + `rag.get_field_values()` for filter prompts, and `rag.discover_metadata_fields()` for collection inspection — they are thin wrappers over these same methods and don't require you to manage the `QdrantStore` instance directly.
 
 ---
 
@@ -702,7 +1005,7 @@ from ragwire import get_retriever, hybrid_search, mmr_search
 | `vectorstore` | `QdrantVectorStore` | — | Vector store instance |
 | `query` | `str` | — | Search query |
 | `k` | `int` | `5` | Number of results |
-| `filters` | `dict` | `None` | Qdrant `Filter` object |
+| `filters` | `dict` | `None` | Plain metadata filter dict (same format as `rag.retrieve()` filters) |
 
 **Returns:** `list[Document]`
 
@@ -719,7 +1022,7 @@ Maximal Marginal Relevance — retrieves diverse, non-redundant results. Use thi
 | `k` | `int` | `5` | Number of results to return |
 | `fetch_k` | `int` | `20` | Candidates fetched before MMR selection |
 | `lambda_mult` | `float` | `0.5` | Diversity (`0.0` = max diverse, `1.0` = max relevant) |
-| `filters` | `dict` | `None` | Qdrant `Filter` object |
+| `filters` | `dict` | `None` | Plain metadata filter dict (same format as `rag.retrieve()` filters) |
 
 **Returns:** `list[Document]`
 

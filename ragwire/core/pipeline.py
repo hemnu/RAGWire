@@ -10,10 +10,13 @@ Coordinates all components of the RAG system:
 - Hybrid retrieval
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+from langchain_core.prompts import ChatPromptTemplate
 
 # Import pipeline components
 from .config import Config
@@ -64,6 +67,8 @@ class RAGWire:
 
         # Load configuration
         self.config = Config(config_path).config
+        # Cache for stored filter values — populated on first query, invalidated after ingestion
+        self._stored_values_cache: Optional[Dict[str, Any]] = None
 
         # Initialize components
         self._initialize_logging()
@@ -138,8 +143,10 @@ class RAGWire:
 
         if provider == "ollama":
             from langchain_ollama import ChatOllama
-            num_ctx = llm_config.get("num_ctx", 16384)
-            llm = ChatOllama(model=model, base_url=base_url, num_ctx=num_ctx)
+            extra = {}
+            if "num_ctx" in llm_config:
+                extra["num_ctx"] = llm_config["num_ctx"]
+            llm = ChatOllama(model=model, base_url=base_url, **extra)
         elif provider == "openai":
             from langchain_openai import ChatOpenAI
             llm = ChatOpenAI(model=model)
@@ -195,6 +202,8 @@ class RAGWire:
             logger.info(f"Using existing collection: {collection_name}")
 
         self.vectorstore = self.vectorstore_wrapper.get_store(use_sparse=use_sparse)
+        existing_fields = self.vectorstore_wrapper.get_metadata_keys()
+        self.vectorstore_wrapper.create_payload_indexes(["file_hash"] + existing_fields)
         logger.info("Vector store initialized")
 
     def _initialize_retriever(self) -> None:
@@ -202,10 +211,11 @@ class RAGWire:
         retriever_config = self.config.get("retriever", {})
         search_type = retriever_config.get("search_type", "hybrid")
         top_k = retriever_config.get("top_k", 5)
+        self._auto_filter = retriever_config.get("auto_filter", False)
         self.retriever = get_retriever(
             self.vectorstore, top_k=top_k, search_type=search_type
         )
-        logger.info(f"Retriever initialized (type={search_type}, top_k={top_k})")
+        logger.info(f"Retriever initialized (type={search_type}, top_k={top_k}, auto_filter={self._auto_filter})")
 
     def ingest_documents(self, file_paths: List[str]) -> Dict[str, Any]:
         """
@@ -282,9 +292,9 @@ class RAGWire:
                 logger.error(f"Error processing {file_path}: {e}", exc_info=True)
 
         # Create payload indexes for all metadata fields so facet API works
-        if stats["processed"] > 0:
-            index_fields = self._filter_fields + ["file_name", "file_type"]
-            self.vectorstore_wrapper.create_payload_indexes(index_fields)
+        all_fields = self.vectorstore_wrapper.get_metadata_keys()
+        self.vectorstore_wrapper.create_payload_indexes(all_fields)
+        self._stored_values_cache = None  # invalidate after ingestion
 
         logger.info(
             f"Ingestion complete: {stats['processed']}/{stats['total']} documents"
@@ -362,11 +372,12 @@ class RAGWire:
         # Split first so we can pass the first chunk to the LLM
         chunk_texts = self.splitter.split_text(text)
 
-        # Extract metadata once from the first chunk using LLM
+        # Extract metadata once from the full document text (capped at 10k chars in extract())
+        # Using chunk_texts[0] (~1000 chars) was too little context to reliably find all fields
         llm_metadata = {}
         if chunk_texts:
             try:
-                llm_metadata = self.metadata_extractor.extract(chunk_texts[0])
+                llm_metadata = self.extract_metadata(text)
                 logger.debug(f"LLM metadata for {file_name}: {llm_metadata}")
             except Exception as e:
                 logger.warning(f"LLM metadata extraction failed for {file_name}: {e}")
@@ -393,29 +404,150 @@ class RAGWire:
 
         return documents
 
-    def _extract_filters_from_query(self, query: str) -> Optional[Dict[str, Any]]:
-        """Use the configured LLM to extract metadata filters from a natural language query."""
-        import json
-        from langchain_core.prompts import ChatPromptTemplate
+    @property
+    def filter_fields(self) -> List[str]:
+        """Return the metadata fields used for filtering and auto-filter extraction.
 
-        fields_desc = ", ".join(self._filter_fields)
+        These are the semantic/LLM-extracted fields only (e.g. company_name, doc_type,
+        fiscal_year). System fields like file_hash, chunk_id, source are excluded.
+        Use this instead of discover_metadata_fields() when building filter prompts.
+        """
+        return self._filter_fields
+
+    @property
+    def _stored_values(self) -> Dict[str, Any]:
+        """Return cached stored filter values, fetching from Qdrant if needed."""
+        if self._stored_values_cache is None:
+            self._stored_values_cache = self.vectorstore_wrapper.get_field_values(
+                self._filter_fields, limit=50
+            )
+        return self._stored_values_cache
+
+    def extract_filters(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract metadata filters from a natural language query.
+
+        Returns the raw extracted filters so the caller (e.g. an agent) can
+        inspect, adjust, or discard them before passing to retrieve().
+
+        Args:
+            query: Natural language query string
+
+        Returns:
+            Dict of extracted filters, or None if nothing was extracted.
+
+        Example:
+            >>> filters = rag.extract_filters("muscle building studies from 2023")
+            >>> # {"research_focus": "muscle building", "publication_year": 2023}
+            >>> # Agent inspects and adjusts if needed
+            >>> results = rag.retrieve(query, filters=filters)
+        """
+        return self._extract_filters_from_query(query)
+
+    def get_filter_context(self, query: str, limit: int = 50) -> str:
+        """
+        Build a ready-made prompt block for an agent describing available metadata
+        filters, their stored values, and the filters extracted from the current query.
+
+        Append or prepend this to your agent's task prompt so the agent can decide
+        whether to apply, adjust, or discard the extracted filters before calling retrieve().
+
+        Args:
+            query: Natural language query string
+            limit: Max stored values to show per field (default: 50)
+
+        Returns:
+            Formatted markdown string ready to inject into an agent prompt.
+
+        Example:
+            >>> context = rag.get_filter_context("muscle building studies from 2023")
+            >>> agent_prompt = context + "\\n\\n" + your_task_prompt
+        """
+        stored_values = self.get_field_values(self._filter_fields, limit=limit)
+        extracted = self.extract_filters(query) or {}
+
+        lines = ["## RAGWire Filter Context", ""]
+        lines.append("### Available Metadata Fields and Stored Values")
+        for field in self._filter_fields:
+            values = stored_values.get(field, [])
+            lines.append(f"- **{field}**: {values}")
+
+        lines.append("")
+        lines.append("### Extracted Filters from Query")
+        if extracted:
+            for k, v in extracted.items():
+                lines.append(f"- **{k}**: `{v}`")
+        else:
+            lines.append("- *(no filters extracted)*")
+
+        lines += [
+            "",
+            "### Instructions",
+            "1. Review the extracted filters above.",
+            "2. If an extracted value does not match or closely relate to any stored value, adjust or drop that filter.",
+            "3. If the query has no clear metadata intent, pass an empty dict `{}` as filters.",
+            "4. Pass the final filters dict to the retrieval tool as `filters=`.",
+        ]
+
+        return "\n".join(lines)
+
+    def _extract_filters_from_query(self, query: str) -> Optional[Dict[str, Any]]:
+        """Use the configured LLM to extract metadata filters from a natural language query.
+
+        Passes actual stored values to the LLM so it can match exactly what's in
+        the collection — avoids mismatches like 'apple' vs 'apple inc.'.
+        """
+        stored_values = self._stored_values
+        fields_desc = "\n".join(
+            f"  {field}: {stored_values.get(field, [])}"
+            for field in self._filter_fields
+        )
+
         prompt_template = (
-            "Extract metadata filters as JSON from the user query.\n"
-            "Only include fields that are clearly mentioned. Return {{}} if no filters apply.\n\n"
-            f"Available fields: {fields_desc}\n\n"
-            "User query: {query}\n\n"
-            "Filters (JSON only):"
+            "You are a metadata filter extractor for a document retrieval system.\n\n"
+            "## Task\n"
+            "Extract metadata filters as a JSON object from the user query.\n"
+            "The filters will be used to narrow down document search results.\n\n"
+            "## Rules\n"
+            "1. Extract a field only when the query clearly and explicitly refers to it.\n"
+            "2. Always extract the value the user asked for — but first check if it is an alias, brand name, or subsidiary of a stored value.\n"
+            "   If the extracted value refers to the same real-world entity as a stored value (e.g. 'google' → 'alphabet inc.', 'instagram' → 'meta'), use the stored value instead.\n"
+            "   If no stored value matches, extract exactly what the user said.\n"
+            "3. Learn the format and structure from stored values, then apply that same format to what the user asked for:\n"
+            "   - Casing: if stored values are lowercase, output lowercase.\n"
+            "   - Prefixes/suffixes: if stored values use a prefix (e.g. 'q1', 'v2', 'dept-hr'), apply it.\n"
+            "   - Data type: if stored values are integers, output integers; if strings, output strings.\n"
+            "   - Lists: if stored values are lists (e.g. [2024, 2025]), output a list.\n"
+            "4. When a query asks for multiple values of the same field (e.g. '2023 and 2024'), output them as a list.\n"
+            "5. Do not infer or guess filters that are not clearly mentioned in the query.\n"
+            "6. Return {{}} if the query contains no metadata references at all.\n\n"
+            "## Format Examples from Stored Values (not a whitelist)\n"
+            f"{fields_desc}\n\n"
+            "## Examples\n"
+            "- Stored: fiscal_quarter: ['q1','q2','q3'] | Query: 'show me Q4 reports' → {{\"fiscal_quarter\": \"q4\"}}\n"
+            "- Stored: fiscal_year: [2024, 2025]       | Query: 'documents from 2022'  → {{\"fiscal_year\": 2022}}\n"
+            "- Stored: department: ['engineering']     | Query: 'HR policies'          → {{\"department\": \"hr\"}}\n"
+            "- Stored: language: ['en']                | Query: 'French documents'     → {{\"language\": \"fr\"}}\n"
+            "- Stored: status: ['active']              | Query: 'all documents'        → {{}}\n"
+            "- Stored: company_name: ['alphabet inc.'] | Query: 'google earnings'       → {{\"company_name\": \"alphabet inc.\"}}\n\n"
+            "## User Query\n"
+            "{query}\n\n"
+            "## Output (JSON only, no explanation)\n"
         )
 
         try:
             chain = ChatPromptTemplate.from_template(prompt_template) | self.metadata_extractor.llm
             response = chain.invoke({"query": query})
-            text = response.content if hasattr(response, "content") else str(response)
-            text = text.strip()
-            start, end = text.find("{"), text.rfind("}") + 1
-            if start != -1 and end > start:
-                filters = json.loads(text[start:end])
+            text = response.text.strip()
+            start = text.find("{")
+            if start != -1:
+                filters, _ = json.JSONDecoder().raw_decode(text, start)
                 if filters:
+                    filters = {
+                        k: [i.lower() if isinstance(i, str) else i for i in v] if isinstance(v, list)
+                           else v.lower() if isinstance(v, str) else v
+                        for k, v in filters.items()
+                    }
                     logger.info(f"Auto-extracted filters from query: {filters}")
                     return filters
         except Exception as e:
@@ -447,7 +579,7 @@ class RAGWire:
         if top_k is None:
             top_k = self.config.get("retriever", {}).get("top_k", 5)
 
-        if filters is None:
+        if filters is None and self._auto_filter:
             filters = self._extract_filters_from_query(query)
 
         # Build search kwargs without mutating the shared retriever
@@ -478,7 +610,7 @@ class RAGWire:
         Returns:
             List of retrieved documents
         """
-        if filters is None:
+        if filters is None and self._auto_filter:
             filters = self._extract_filters_from_query(query)
         qdrant_filter = self._build_qdrant_filter(filters) if filters else None
         return hybrid_search(self.vectorstore, query, k=k, filters=qdrant_filter)
@@ -491,13 +623,19 @@ class RAGWire:
         conditions = []
         for key, value in filters.items():
             if isinstance(value, list):
-                for v in value:
-                    conditions.append(
-                        rest.FieldCondition(
-                            key=f"metadata.{key}",
-                            match=rest.MatchValue(value=v),
-                        )
+                # OR logic within a field: doc must match any one of the values
+                # (e.g. fiscal_year [2023, 2024] → year is 2023 OR 2024)
+                conditions.append(
+                    rest.Filter(
+                        should=[
+                            rest.FieldCondition(
+                                key=f"metadata.{key}",
+                                match=rest.MatchValue(value=v),
+                            )
+                            for v in value
+                        ]
                     )
+                )
             else:
                 conditions.append(
                     rest.FieldCondition(
@@ -537,7 +675,7 @@ class RAGWire:
 
         Args:
             fields: A field name (str) or list of field names
-            limit: Max unique values to return per field (default: 20)
+            limit: Max unique values to return per field (default: 50)
 
         Returns:
             - If fields is a str: list of unique values for that field
@@ -555,6 +693,26 @@ class RAGWire:
         result = self.vectorstore_wrapper.get_field_values(field_list, limit=limit)
         return result[fields] if single else result
 
+    def extract_metadata(self, text: str) -> Dict[str, Any]:
+        """
+        Extract metadata from text using the configured LLM.
+
+        Automatically passes stored collection values so the LLM reuses
+        existing entity names (e.g. 'apple inc.') instead of extracting
+        inconsistent variants ('apple', 'Apple Inc.').
+
+        Args:
+            text: Document text to extract metadata from
+
+        Returns:
+            Dictionary of extracted metadata fields
+
+        Example:
+            >>> metadata = rag.extract_metadata(open("report.pdf.txt").read())
+            >>> print(metadata)
+            {'company_name': 'apple inc.', 'doc_type': '10-k', 'fiscal_year': [2025]}
+        """
+        return self.metadata_extractor.extract(text, stored_values=self._stored_values)
     def get_stats(self) -> Dict[str, Any]:
         """
         Get pipeline statistics.
